@@ -1,0 +1,138 @@
+name: build-latest
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  # State-gate fix, half 1: recipe changes trigger a build directly instead
+  # of sitting unbuilt until upstream moves (the reference repo's documented
+  # gotcha). Half 2 is the ctx hash inside the state key (scripts/ctx-hash.sh),
+  # which makes the cron self-healing if a push-triggered run failed.
+  # state/ is NOT in the paths list and state commits carry [skip ci], so a
+  # state push can never retrigger.
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - entrypoint.sh
+      - .github/actions/build-and-push-arch/action.yml
+      - .github/workflows/_build.yml
+      - .github/workflows/build-latest.yml
+
+# contents stays read here; only the state job commits (job-level override).
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-latest
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: sm0svx/svxlink
+  # Refuse to build below this floor — protects against a bad "latest
+  # release" resolution (upstream has legacy YYMMDD-style tags).
+  MIN_VERSION: "26.05"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.gate.outputs.changed }}
+      key: ${{ steps.gate.outputs.key }}
+      tag: ${{ steps.rel.outputs.tag }}
+      sha: ${{ steps.rel.outputs.sha }}
+      tags: ${{ steps.tags.outputs.list }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve newest upstream release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # releases/latest = newest non-prerelease. Upstream versions are
+          # YY.MM[.N] with no v-prefix; the shape check keeps a legacy tag
+          # (090426-style) or a renamed scheme from ever slipping through.
+          TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          [[ "$TAG" =~ ^[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]] || {
+            echo "::error::unexpected release tag format: $TAG"; exit 1; }
+          # sort -V is exactly right for YY.MM[.N] (26.05 < 26.05.1 < 26.06).
+          if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$TAG" | sort -V | head -1)" != "$MIN_VERSION" ]; then
+            echo "::error::refusing to build $TAG below floor $MIN_VERSION"; exit 1
+          fi
+          # Resolve the tag to the COMMIT sha — annotated tags point at a tag
+          # object that must be dereferenced once more.
+          SHA=$(gh api "repos/$UPSTREAM/git/ref/tags/$TAG" --jq .object.sha)
+          TYPE=$(gh api "repos/$UPSTREAM/git/ref/tags/$TAG" --jq .object.type)
+          if [ "$TYPE" = "tag" ]; then
+            SHA=$(gh api "repos/$UPSTREAM/git/tags/$SHA" --jq .object.sha)
+          fi
+          echo "release: $TAG @ $SHA"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: State gate (upstream tag + recipe hash)
+        id: gate
+        run: |
+          set -euo pipefail
+          CTX=$(./scripts/ctx-hash.sh .github/workflows/build-latest.yml)
+          NEW="${{ steps.rel.outputs.tag }} ctx:${CTX}"
+          LAST=$(cat state/last-release.txt 2>/dev/null || echo "")
+          if [ "$LAST" = "$NEW" ]; then
+            echo "No change ($LAST). Skipping build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "key moved: '$LAST' -> '$NEW'"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "key=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tag list
+        id: tags
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          MINOR="${TAG%.*}"
+          IMG=ghcr.io/${{ github.repository_owner }}/svxlink-server
+          {
+            echo "list<<EOF"
+            echo "$IMG:latest"
+            echo "$IMG:$TAG"
+            # :26.05 series alias only when the release has a patch component
+            # (a bare 26.05 release already IS that tag).
+            if [ "$MINOR" != "$TAG" ] && [[ "$MINOR" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+              echo "$IMG:$MINOR"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    uses: ./.github/workflows/_build.yml
+    with:
+      # Always the resolved commit SHA, never the tag name — the Dockerfile
+      # git-fetches exactly this, so image contents can never diverge from
+      # what the gate resolved and the revision label claims.
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.tag }}
+      channel: latest
+      tags: ${{ needs.prepare.outputs.tags }}
+
+  state:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Update state file
+        run: |
+          ./scripts/commit-state.sh \
+            state/last-release.txt \
+            "${{ needs.prepare.outputs.key }}" \
+            "chore(state): release ${{ needs.prepare.outputs.tag }} [skip ci]"

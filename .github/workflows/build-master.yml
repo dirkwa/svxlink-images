@@ -1,0 +1,120 @@
+name: build-master
+
+on:
+  schedule:
+    - cron: "15 */3 * * *"
+  workflow_dispatch:
+  # Same recipe-path trigger rationale as build-latest.yml.
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - entrypoint.sh
+      - .github/actions/build-and-push-arch/action.yml
+      - .github/workflows/_build.yml
+      - .github/workflows/build-master.yml
+
+# contents stays read here; only the state job commits (job-level override).
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-master
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: sm0svx/svxlink
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.gate.outputs.changed }}
+      key: ${{ steps.gate.outputs.key }}
+      sha: ${{ steps.sha.outputs.sha }}
+      short: ${{ steps.sha.outputs.short }}
+      version: ${{ steps.sha.outputs.version }}
+      tags: ${{ steps.tags.outputs.list }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve upstream master HEAD + version
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/$UPSTREAM/commits/master" --jq .sha)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "Failed to resolve master HEAD" >&2; exit 1
+          fi
+          echo "sha=$SHA"         >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+          # PROJECT= from src/versions at THAT sha (there is no package.json
+          # analogue). Best-effort: an empty version still builds, it only
+          # degrades the version label. The +git.<sha7> suffix lets `svx
+          # status` distinguish a snapshot from the release it is based on.
+          PROJECT=$(gh api "repos/$UPSTREAM/contents/src/versions?ref=$SHA" \
+            --jq .content | base64 -d | sed -n 's/^PROJECT=//p' | tr -d '[:space:]' || true)
+          VERSION="${PROJECT:-unknown}+git.${SHA:0:7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "svxlink version: $VERSION"
+
+      - name: State gate (upstream sha + recipe hash)
+        id: gate
+        run: |
+          set -euo pipefail
+          CTX=$(./scripts/ctx-hash.sh .github/workflows/build-master.yml)
+          NEW="${{ steps.sha.outputs.sha }} ctx:${CTX}"
+          LAST=$(cat state/last-master-sha.txt 2>/dev/null || echo "")
+          if [ "$LAST" = "$NEW" ]; then
+            echo "No change ($LAST). Skipping build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "key moved: '$LAST' -> '$NEW'"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "key=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tag list
+        id: tags
+        run: |
+          set -euo pipefail
+          IMG=ghcr.io/${{ github.repository_owner }}/svxlink-server
+          {
+            echo "list<<EOF"
+            echo "$IMG:master"
+            echo "$IMG:master-${{ steps.sha.outputs.short }}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    uses: ./.github/workflows/_build.yml
+    with:
+      # The gate-resolved SHA, not "master": closes the reference repo's
+      # race where the in-Dockerfile clone could pick up a NEWER head than
+      # the one gated and labelled.
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      channel: master
+      tags: ${{ needs.prepare.outputs.tags }}
+
+  state:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Update state file
+        run: |
+          ./scripts/commit-state.sh \
+            state/last-master-sha.txt \
+            "${{ needs.prepare.outputs.key }}" \
+            "chore(state): master ${{ needs.prepare.outputs.short }} [skip ci]"

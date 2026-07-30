@@ -1,0 +1,118 @@
+name: _build
+
+# Reusable core shared by build-latest / build-master / manual: native-runner
+# matrix build (digest-only pushes) followed by a manifest-list merge. The
+# reference repo duplicates this boilerplate per workflow; here EVERY stream
+# is a C++ source build, so triplication would be a drift hazard.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Upstream sm0svx/svxlink FULL commit SHA to build."
+        type: string
+        required: true
+      version:
+        description: "svxlink PROJECT version for the version label."
+        type: string
+        required: true
+      channel:
+        description: "Channel label: latest | master | manual."
+        type: string
+        required: true
+      tags:
+        description: "Newline-separated list of full image refs to tag."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/svxlink-server
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch_label: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch_label: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build single-arch image
+        id: build
+        uses: ./.github/actions/build-and-push-arch
+        with:
+          platform: ${{ matrix.platform }}
+          ref: ${{ inputs.ref }}
+          version: ${{ inputs.version }}
+          channel: ${{ inputs.channel }}
+          image: ${{ env.IMAGE }}
+
+      # Matrix job outputs cannot reliably aggregate across matrix entries —
+      # GitHub keeps the last entry's value — so the per-arch digest travels
+      # through an artifact round-trip instead.
+      - name: Stash digest for the merge job
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.arch_label }}
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch_label }}
+          path: /tmp/digests/${{ matrix.arch_label }}
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: false
+
+      - name: Create multi-arch manifest
+        run: |
+          set -euo pipefail
+          AMD_DIGEST=$(cat /tmp/digests/digest-amd64/amd64)
+          ARM_DIGEST=$(cat /tmp/digests/digest-arm64/arm64)
+          if [ -z "$AMD_DIGEST" ] || [ -z "$ARM_DIGEST" ]; then
+            echo "Missing digests: amd64=$AMD_DIGEST arm64=$ARM_DIGEST" >&2
+            exit 1
+          fi
+          TAG_ARGS=()
+          while IFS= read -r t; do
+            [ -n "$t" ] && TAG_ARGS+=(-t "$t")
+          done <<< "${{ inputs.tags }}"
+          if [ "${#TAG_ARGS[@]}" -eq 0 ]; then
+            echo "No tags supplied" >&2
+            exit 1
+          fi
+          docker buildx imagetools create "${TAG_ARGS[@]}" \
+            "${{ env.IMAGE }}@${AMD_DIGEST}" \
+            "${{ env.IMAGE }}@${ARM_DIGEST}"

@@ -1,0 +1,91 @@
+name: Build and push (single architecture, digest-only)
+description: >
+  Build the svxlink-server image for a single platform on a NATIVE runner
+  and push by digest only (no tag). The caller assembles a manifest list
+  across architectures in a follow-up job. There is deliberately no QEMU
+  variant of this action: every build is a full C++ compile, which under
+  emulation takes hours instead of ~10-15 minutes.
+
+inputs:
+  platform:
+    description: "Target buildx platform, e.g. linux/amd64 or linux/arm64."
+    required: true
+  ref:
+    description: >-
+      Upstream sm0svx/svxlink ref to build — ALWAYS the gate-resolved full
+      commit SHA in CI (the Dockerfile fetches it with git init+fetch, so a
+      raw SHA works). Passing a branch name here reopens the
+      "master moved between gate and build" race — don't.
+    required: true
+  version:
+    description: >-
+      svxlink PROJECT version string, stamped into the
+      org.opencontainers.image.version label. svxlink has no HTTP API, so
+      this label is the PRIMARY RuntimeIdentity the svx CLI reports — not a
+      backup. Master builds pass "<PROJECT>+git.<sha7>".
+    required: true
+  channel:
+    description: "Channel label value: latest | master | manual."
+    required: true
+  image:
+    description: "Image repository (no tag): ghcr.io/owner/svxlink-server."
+    required: true
+
+outputs:
+  digest:
+    description: "The single-arch manifest digest just pushed to GHCR."
+    value: ${{ steps.build.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Log in to GHCR
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - name: Resolve label values
+      id: meta
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Real build time — the reference repo used
+        # github.event.repository.updated_at, which on schedule events is the
+        # repo's last-push time, not the build time.
+        echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        # Sounds identity is read from the Dockerfile ARGs so the label can
+        # never drift from what the build actually bakes.
+        NAME=$(sed -n 's/^ARG SOUNDS_NAME=//p' Dockerfile)
+        VER=$(sed -n 's/^ARG SOUNDS_VERSION=//p' Dockerfile)
+        echo "sounds=${NAME}-${VER}" >> "$GITHUB_OUTPUT"
+
+    - name: Build and push by digest
+      id: build
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: ${{ inputs.platform }}
+        push: true
+        provenance: true
+        sbom: true
+        cache-from: type=gha,scope=${{ inputs.platform }}
+        cache-to: type=gha,mode=max,scope=${{ inputs.platform }}
+        build-args: |
+          SVXLINK_REF=${{ inputs.ref }}
+        outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.version=${{ inputs.version }}
+          org.opencontainers.image.revision=${{ inputs.ref }}
+          org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          org.opencontainers.image.title=svxlink-server
+          org.opencontainers.image.description=Unofficial multi-arch SvxLink server image (Debian Trixie, built from sm0svx/svxlink source)
+          org.svxlink.image.channel=${{ inputs.channel }}
+          org.svxlink.image.builder-sha=${{ github.sha }}
+          org.svxlink.image.sounds=${{ steps.meta.outputs.sounds }}

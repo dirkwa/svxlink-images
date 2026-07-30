@@ -1,0 +1,91 @@
+name: manual
+
+# One-off builds of an arbitrary upstream ref. No state gate, no state
+# commit — deterministic :git-<sha7> tags (plus an optional extra tag).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref: release tag, branch, or full commit SHA."
+        required: true
+        default: "master"
+      extra_tag:
+        description: "Optional additional image tag (bare tag name, e.g. test-foo)."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: manual
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: sm0svx/svxlink
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      version: ${{ steps.sha.outputs.version }}
+      tags: ${{ steps.tags.outputs.list }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve ref to commit SHA + version
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Via env, not inline ${{ }} interpolation into bash: an input with
+          # spaces/quotes would otherwise be substituted into the script text
+          # verbatim and break it (dispatchers are trusted, but a typo should
+          # fail loudly, not weirdly).
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          # commits/<ref> dereferences branches, tags (annotated included)
+          # and abbreviated SHAs to the commit in one call.
+          SHA=$(gh api "repos/$UPSTREAM/commits/$REF" --jq .sha)
+          [ -n "$SHA" ] && [ "$SHA" != "null" ]
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          PROJECT=$(gh api "repos/$UPSTREAM/contents/src/versions?ref=$SHA" \
+            --jq .content | base64 -d | sed -n 's/^PROJECT=//p' | tr -d '[:space:]' || true)
+          echo "version=${PROJECT:-unknown}+git.${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tag list
+        id: tags
+        env:
+          EXTRA_TAG: ${{ inputs.extra_tag }}
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.sha.outputs.sha }}"
+          IMG=ghcr.io/${{ github.repository_owner }}/svxlink-server
+          if [ -n "$EXTRA_TAG" ]; then
+            # OCI tag grammar; an invalid tag would otherwise fail late and
+            # confusingly in the merge job's imagetools create.
+            [[ "$EXTRA_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || {
+              echo "::error::invalid extra_tag: $EXTRA_TAG"; exit 1; }
+          fi
+          {
+            echo "list<<EOF"
+            echo "$IMG:git-${SHA:0:7}"
+            if [ -n "$EXTRA_TAG" ]; then
+              echo "$IMG:$EXTRA_TAG"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/_build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      channel: manual
+      tags: ${{ needs.prepare.outputs.tags }}
